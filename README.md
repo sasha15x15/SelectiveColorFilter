@@ -2,6 +2,8 @@
 
 A high-performance Windows application for real-time selective color filtering with GPU acceleration. Filter out unwanted colors while preserving selected ones across multiple monitors.
 
+![Main Interface](screenshots/main-interface.png)
+
 ## Features
 
 - **GPU-Accelerated Processing** - DirectX 11 compute shaders for maximum performance
@@ -14,11 +16,25 @@ A high-performance Windows application for real-time selective color filtering w
 - **Color Picker Tools** - Built-in color picker and eyedropper tool
 - **High Refresh Rate Support** - Optimized for 144Hz+ gaming monitors
 
+## Screenshots
+
+### Color Selection
+![Color Picker](screenshots/color-picker.png)
+
+### Filtering in Action
+![Filtering Demo](screenshots/filtering-demo.png)
+
 ## System Requirements
 
 - Windows 10/11
 - DirectX 11 compatible graphics card
 - Visual C++ Redistributable 2019 or later
+
+### Tested Configuration
+- **OS**: Windows 10
+- **Hardware**: Laptop with Intel integrated graphics + NVIDIA discrete GPU
+- **Setup**: External monitor connected to discrete GPU
+- **Performance**: Stable 144Hz filtering on both integrated and discrete graphics
 
 ## Usage
 
