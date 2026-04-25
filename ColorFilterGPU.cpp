@@ -4,15 +4,23 @@
 #include <d3dcompiler.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <audiopolicy.h>
+#include <shlobj.h>
 #include <string>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <algorithm>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 // Глобальные переменные
 HWND g_hWnd = NULL;
@@ -21,8 +29,9 @@ HWND g_hTrackbarThreshold, g_hTrackbarSmoothing;
 HWND g_hLabelColor, g_hLabelThreshold, g_hLabelSmoothing;
 HWND g_hButtonStart, g_hButtonStop;
 HWND g_hColorList, g_hAddColorButton, g_hRemoveColorButton;
-HWND g_hVSyncCheckbox, g_hGrayscaleCombo;
-HWND g_hSaveButton, g_hLoadButton;
+HWND g_hVSyncCheckbox, g_hGrayscaleCombo, g_hAudioCheckbox;
+HWND g_hSaveButton, g_hLoadButton, g_hScreenshotButton;
+UINT_PTR g_topMostTimer = 0; // Таймер для поддержания поверх всех окон
 std::vector<HWND> g_hCheckboxes; // Чекбоксы для каждого монитора
 std::vector<HWND> g_hFPSLabels; // FPS лейблы для каждого монитора
 
@@ -38,7 +47,28 @@ bool g_isDragging = false;
 bool g_shouldStopRenderThread = false;
 bool g_vsyncEnabled = true;
 int g_grayscaleMode = 1; // 0=Average, 1=Luminosity, 2=HD, 3=Desaturation, 4=Max, 5=Green
+bool g_enableAudioCapture = false;
 HANDLE g_renderThread = NULL;
+
+// Screenshot settings
+wchar_t g_screenshotFolder[MAX_PATH] = L"";
+int g_screenshotKey = VK_F12; // Default F12
+bool g_saveToFolder = true;
+bool g_saveToClipboard = false;
+int g_screenshotFormat = 0; // 0=BMP, 1=PNG, 2=JPG
+bool g_takingScreenshot = false; // Защита от повторных вызовов
+bool g_pauseRendering = false; // Пауза рендеринга для скриншота
+HHOOK g_keyboardHook = NULL; // Хук клавиатуры
+
+// Audio capture для Discord
+IMMDeviceEnumerator* g_pEnumerator = nullptr;
+IMMDevice* g_pDevice = nullptr;
+IAudioClient* g_pAudioClient = nullptr;
+IAudioCaptureClient* g_pCaptureClient = nullptr;
+IAudioClient* g_pPlaybackClient = nullptr;
+IAudioRenderClient* g_pRenderClient = nullptr;
+HANDLE g_audioThread = NULL;
+bool g_shouldStopAudioThread = false;
 
 // Структура для каждого монитора
 struct MonitorData {
@@ -248,10 +278,20 @@ void SaveSettings();
 void LoadSettings();
 void SaveSettingsToFile();
 void LoadSettingsFromFile();
+void StartAudioCapture();
+void StopAudioCapture();
+DWORD WINAPI AudioThreadProc(LPVOID lpParam);
+void TakeScreenshot();
+void ShowScreenshotSettings();
+void SaveScreenshotSettings();
+void LoadScreenshotSettings();
+wchar_t* GetKeyName(int vkCode);
+INT_PTR CALLBACK ScreenshotSettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 void RenderFrameForMonitor(MonitorData& monitor);
 void StartFilter();
 void StopFilter();
 void CleanupDirectX();
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 bool InitDirectXForMonitor(MonitorData& monitor);
 bool InitShadersForMonitor(MonitorData& monitor);
 bool InitSwapChainForMonitor(MonitorData& monitor);
@@ -556,6 +596,552 @@ void RemoveColorFromList() {
     }
 }
 
+DWORD WINAPI AudioThreadProc(LPVOID lpParam) {
+    CoInitialize(NULL);
+    
+    while (!g_shouldStopAudioThread) {
+        if (g_pCaptureClient && g_pRenderClient) {
+            UINT32 packetLength = 0;
+            HRESULT hr = g_pCaptureClient->GetNextPacketSize(&packetLength);
+            
+            if (SUCCEEDED(hr) && packetLength > 0) {
+                BYTE* pData;
+                UINT32 numFramesAvailable;
+                DWORD flags;
+                
+                hr = g_pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
+                if (SUCCEEDED(hr)) {
+                    // Получаем буфер для воспроизведения
+                    BYTE* pRenderData;
+                    hr = g_pRenderClient->GetBuffer(numFramesAvailable, &pRenderData);
+                    if (SUCCEEDED(hr)) {
+                        // Копируем данные на полную громкость для Discord (но поток заглушен локально)
+                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                            memset(pRenderData, 0, numFramesAvailable * 4 * 2); // 4 bytes * 2 channels
+                        } else {
+                            // Копируем оригинальные данные на полную громкость
+                            // Discord увидит полный звук, но локально он заглушен через ISimpleAudioVolume
+                            memcpy(pRenderData, pData, numFramesAvailable * 4 * 2);
+                        }
+                        g_pRenderClient->ReleaseBuffer(numFramesAvailable, 0);
+                    }
+                    g_pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                }
+            }
+        }
+        Sleep(1);
+    }
+    
+    CoUninitialize();
+    return 0;
+}
+
+void StartAudioCapture() {
+    if (g_pEnumerator) return; // Уже запущен
+    
+    CoInitialize(NULL);
+    
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, 
+        __uuidof(IMMDeviceEnumerator), (void**)&g_pEnumerator);
+    if (FAILED(hr)) return;
+    
+    // Получаем устройство по умолчанию для захвата (loopback)
+    hr = g_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &g_pDevice);
+    if (FAILED(hr)) return;
+    
+    // Создаем клиент для захвата
+    hr = g_pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_pAudioClient);
+    if (FAILED(hr)) return;
+    
+    WAVEFORMATEX* pwfx = NULL;
+    hr = g_pAudioClient->GetMixFormat(&pwfx);
+    if (FAILED(hr)) return;
+    
+    // Инициализируем захват в loopback режиме
+    hr = g_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        10000000, 0, pwfx, NULL);
+    if (FAILED(hr)) return;
+    
+    hr = g_pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&g_pCaptureClient);
+    if (FAILED(hr)) return;
+    
+    // Создаем клиент для воспроизведения (чтобы Discord видел)
+    IMMDevice* pPlaybackDevice = NULL;
+    hr = g_pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pPlaybackDevice);
+    if (SUCCEEDED(hr)) {
+        hr = pPlaybackDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_pPlaybackClient);
+        if (SUCCEEDED(hr)) {
+            hr = g_pPlaybackClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0, pwfx, NULL);
+            if (SUCCEEDED(hr)) {
+                g_pPlaybackClient->GetService(__uuidof(IAudioRenderClient), (void**)&g_pRenderClient);
+                
+                // Получаем интерфейс громкости
+                ISimpleAudioVolume* pVolume = NULL;
+                if (SUCCEEDED(g_pPlaybackClient->GetService(__uuidof(ISimpleAudioVolume), (void**)&pVolume))) {
+                    // Устанавливаем громкость на 0 для локального воспроизведения
+                    pVolume->SetMasterVolume(0.0f, NULL);
+                    pVolume->Release();
+                }
+                
+                g_pPlaybackClient->Start();
+            }
+        }
+        pPlaybackDevice->Release();
+    }
+    
+    CoTaskMemFree(pwfx);
+    
+    g_pAudioClient->Start();
+    
+    // Запускаем поток обработки аудио
+    g_shouldStopAudioThread = false;
+    g_audioThread = CreateThread(NULL, 0, AudioThreadProc, NULL, 0, NULL);
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && wParam == WM_KEYDOWN) {
+        KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
+        if (pKeyboard->vkCode == g_screenshotKey && g_isRunning) {
+            TakeScreenshot();
+        }
+    }
+    // Передаем событие дальше (не блокируем клавишу)
+    return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+}
+
+void TakeScreenshot() {
+    if (!g_isRunning || g_takingScreenshot) return;
+    
+    g_takingScreenshot = true;
+    
+    // Приостанавливаем рендеринг
+    g_pauseRendering = true;
+    Sleep(50); // Даем время завершить текущий кадр
+    
+    // Находим первый активный монитор
+    MonitorData* activeMonitor = nullptr;
+    for (auto& monitor : g_monitors) {
+        if (monitor.isActive) {
+            activeMonitor = &monitor;
+            break;
+        }
+    }
+    
+    if (!activeMonitor || !activeMonitor->pSwapChain) {
+        g_pauseRendering = false;
+        g_takingScreenshot = false;
+        return;
+    }
+    
+    // Получаем back buffer из SwapChain (отрендеренный кадр с фильтром)
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    HRESULT hr = activeMonitor->pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
+    if (FAILED(hr)) {
+        g_pauseRendering = false;
+        g_takingScreenshot = false;
+        return;
+    }
+    
+    D3D11_TEXTURE2D_DESC desc;
+    pBackBuffer->GetDesc(&desc);
+    
+    // Создаем staging texture
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    
+    ID3D11Texture2D* pStagingTexture = nullptr;
+    hr = activeMonitor->pDevice->CreateTexture2D(&desc, nullptr, &pStagingTexture);
+    if (FAILED(hr)) {
+        pBackBuffer->Release();
+        g_pauseRendering = false;
+        g_takingScreenshot = false;
+        return;
+    }
+    
+    // Копируем отрендеренный кадр
+    activeMonitor->pContext->CopyResource(pStagingTexture, pBackBuffer);
+    
+    // Читаем данные (теперь без DO_NOT_WAIT, так как рендеринг приостановлен)
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = activeMonitor->pContext->Map(pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    
+    if (SUCCEEDED(hr)) {
+        // Создаем копию данных и исправляем цветовые каналы
+        UINT dataSize = desc.Height * mapped.RowPitch;
+        BYTE* pixelData = new BYTE[dataSize];
+        memcpy(pixelData, mapped.pData, dataSize);
+        
+        activeMonitor->pContext->Unmap(pStagingTexture, 0);
+        
+        // Исправляем порядок цветовых каналов (BGRA -> RGBA)
+        for (UINT y = 0; y < desc.Height; y++) {
+            BYTE* row = pixelData + y * mapped.RowPitch;
+            for (UINT x = 0; x < desc.Width; x++) {
+                BYTE* pixel = row + x * 4;
+                std::swap(pixel[0], pixel[2]); // Меняем B и R местами
+            }
+        }
+        
+        // Создаем bitmap
+        BITMAPINFOHEADER bi = {};
+        bi.biSize = sizeof(BITMAPINFOHEADER);
+        bi.biWidth = desc.Width;
+        bi.biHeight = -(LONG)desc.Height;
+        bi.biPlanes = 1;
+        bi.biBitCount = 32;
+        bi.biCompression = BI_RGB;
+        
+        HDC hdc = GetDC(NULL);
+        HBITMAP hBitmap = CreateDIBitmap(hdc, &bi, CBM_INIT, pixelData, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+        ReleaseDC(NULL, hdc);
+        
+        if (hBitmap) {
+            // Сохраняем в буфер обмена
+            if (g_saveToClipboard) {
+                if (OpenClipboard(g_hWnd)) {
+                    EmptyClipboard();
+                    SetClipboardData(CF_BITMAP, hBitmap);
+                    CloseClipboard();
+                }
+            }
+            
+            // Сохраняем в файл
+            if (g_saveToFolder && wcslen(g_screenshotFolder) > 0) {
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                wchar_t fileName[MAX_PATH];
+                swprintf_s(fileName, L"%s\\Screenshot_%04d%02d%02d_%02d%02d%02d.bmp", 
+                    g_screenshotFolder, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+                
+                HANDLE hFile = CreateFileW(fileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    BITMAPFILEHEADER bfh = {};
+                    bfh.bfType = 0x4D42;
+                    bfh.bfSize = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + desc.Width * desc.Height * 4;
+                    bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+                    
+                    DWORD written;
+                    WriteFile(hFile, &bfh, sizeof(bfh), &written, NULL);
+                    WriteFile(hFile, &bi, sizeof(bi), &written, NULL);
+                    WriteFile(hFile, pixelData, desc.Width * desc.Height * 4, &written, NULL);
+                    CloseHandle(hFile);
+                }
+            }
+            
+            if (!g_saveToClipboard) {
+                DeleteObject(hBitmap);
+            }
+        }
+        
+        delete[] pixelData;
+    }
+    
+    pStagingTexture->Release();
+    pBackBuffer->Release();
+    
+    // Возобновляем рендеринг
+    g_pauseRendering = false;
+    g_takingScreenshot = false;
+}
+
+INT_PTR CALLBACK ScreenshotSettingsDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+    static HWND hFolderEdit, hKeyEdit, hFormatCombo, hSaveFolderCheck, hSaveClipboardCheck;
+    
+    switch (message) {
+        case WM_INITDIALOG: {
+            // Создаем элементы управления
+            CreateWindowW(L"STATIC", L"Folder:", WS_CHILD | WS_VISIBLE, 10, 10, 50, 20, hDlg, NULL, NULL, NULL);
+            hFolderEdit = CreateWindowW(L"EDIT", g_screenshotFolder, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY,
+                70, 10, 200, 20, hDlg, NULL, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                280, 10, 60, 20, hDlg, (HMENU)1005, NULL, NULL);
+            
+            CreateWindowW(L"STATIC", L"Hotkey:", WS_CHILD | WS_VISIBLE, 10, 40, 50, 20, hDlg, NULL, NULL, NULL);
+            hKeyEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY,
+                70, 40, 100, 20, hDlg, (HMENU)1004, NULL, NULL);
+            
+            CreateWindowW(L"STATIC", L"Format:", WS_CHILD | WS_VISIBLE, 10, 70, 50, 20, hDlg, NULL, NULL, NULL);
+            hFormatCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                70, 70, 100, 100, hDlg, (HMENU)1006, NULL, NULL);
+            SendMessage(hFormatCombo, CB_ADDSTRING, 0, (LPARAM)L"BMP");
+            SendMessage(hFormatCombo, CB_ADDSTRING, 0, (LPARAM)L"PNG");
+            SendMessage(hFormatCombo, CB_ADDSTRING, 0, (LPARAM)L"JPG");
+            SendMessage(hFormatCombo, CB_SETCURSEL, g_screenshotFormat, 0);
+            
+            hSaveFolderCheck = CreateWindowW(L"BUTTON", L"Save to folder", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                10, 100, 120, 20, hDlg, (HMENU)1002, NULL, NULL);
+            CheckDlgButton(hDlg, 1002, g_saveToFolder ? BST_CHECKED : BST_UNCHECKED);
+            
+            hSaveClipboardCheck = CreateWindowW(L"BUTTON", L"Save to clipboard", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                10, 125, 120, 20, hDlg, (HMENU)1003, NULL, NULL);
+            CheckDlgButton(hDlg, 1003, g_saveToClipboard ? BST_CHECKED : BST_UNCHECKED);
+            
+            CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                200, 160, 60, 25, hDlg, (HMENU)IDOK, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                270, 160, 60, 25, hDlg, (HMENU)IDCANCEL, NULL, NULL);
+            
+            // Отображаем клавишу
+            wchar_t keyName[32];
+            swprintf_s(keyName, L"F%d", g_screenshotKey - VK_F1 + 1);
+            SetWindowTextW(hKeyEdit, keyName);
+            
+            return TRUE;
+        }
+        
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case 1005: { // Browse folder
+                    BROWSEINFO bi = {};
+                    bi.hwndOwner = hDlg;
+                    bi.lpszTitle = L"Select screenshot folder";
+                    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+                    
+                    LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+                    if (pidl) {
+                        wchar_t path[MAX_PATH];
+                        if (SHGetPathFromIDList(pidl, path)) {
+                            wcscpy_s(g_screenshotFolder, path);
+                            SetWindowTextW(hFolderEdit, g_screenshotFolder);
+                        }
+                        CoTaskMemFree(pidl);
+                    }
+                    break;
+                }
+                
+                case 1006: // Format combo
+                    if (HIWORD(wParam) == CBN_SELCHANGE) {
+                        g_screenshotFormat = (int)SendMessage(hFormatCombo, CB_GETCURSEL, 0, 0);
+                    }
+                    break;
+                
+                case IDOK:
+                    g_saveToFolder = (IsDlgButtonChecked(hDlg, 1002) == BST_CHECKED);
+                    g_saveToClipboard = (IsDlgButtonChecked(hDlg, 1003) == BST_CHECKED);
+                    SaveSettings();
+                    EndDialog(hDlg, IDOK);
+                    break;
+                    
+                case IDCANCEL:
+                    EndDialog(hDlg, IDCANCEL);
+                    break;
+            }
+            break;
+            
+        case WM_KEYDOWN:
+            if (wParam >= VK_F1 && wParam <= VK_F12) {
+                g_screenshotKey = (int)wParam;
+                wchar_t keyName[32];
+                swprintf_s(keyName, L"F%d", g_screenshotKey - VK_F1 + 1);
+                SetWindowTextW(hKeyEdit, keyName);
+            }
+            break;
+    }
+    return FALSE;
+}
+
+// Глобальные переменные для диалога настроек
+HWND g_hScreenshotDlg = NULL;
+HWND g_hFolderEdit, g_hKeyEdit, g_hFormatCombo, g_hSaveFolderCheck, g_hSaveClipboardCheck;
+bool g_waitingForKey = false;
+
+LRESULT CALLBACK ScreenshotDlgProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case 1005: { // Browse folder
+                    BROWSEINFOW bi = {};
+                    bi.hwndOwner = hWnd;
+                    bi.lpszTitle = L"Select screenshot folder";
+                    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+                    
+                    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+                    if (pidl) {
+                        wchar_t path[MAX_PATH];
+                        if (SHGetPathFromIDListW(pidl, path)) {
+                            wcscpy_s(g_screenshotFolder, path);
+                            SetWindowTextW(g_hFolderEdit, g_screenshotFolder);
+                        }
+                        CoTaskMemFree(pidl);
+                    }
+                    break;
+                }
+                
+                case 1007: // Change key button
+                    g_waitingForKey = true;
+                    SetWindowTextW(g_hKeyEdit, L"Press any key...");
+                    SetFocus(hWnd);
+                    break;
+                
+                case IDOK:
+                    g_saveToFolder = (SendMessage(g_hSaveFolderCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    g_saveToClipboard = (SendMessage(g_hSaveClipboardCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    SaveSettings();
+                    
+                    DestroyWindow(hWnd);
+                    g_hScreenshotDlg = NULL;
+                    break;
+                    
+                case IDCANCEL:
+                    DestroyWindow(hWnd);
+                    g_hScreenshotDlg = NULL;
+                    break;
+            }
+            break;
+            
+        case WM_KEYDOWN:
+            if (g_waitingForKey) {
+                if (wParam != VK_ESCAPE && wParam != VK_RETURN) {
+                    g_screenshotKey = (int)wParam;
+                    SetWindowTextW(g_hKeyEdit, GetKeyName(g_screenshotKey));
+                    g_waitingForKey = false;
+                } else if (wParam == VK_ESCAPE) {
+                    SetWindowTextW(g_hKeyEdit, GetKeyName(g_screenshotKey));
+                    g_waitingForKey = false;
+                }
+                return 0;
+            }
+            break;
+            
+        case WM_NCHITTEST: {
+            LRESULT hit = DefWindowProc(hWnd, message, wParam, lParam);
+            if (hit == HTCLIENT) {
+                return HTCAPTION; // Позволяет перетаскивать окно за любую область
+            }
+            return hit;
+        }
+            
+        case WM_SYSCOMMAND:
+            if (wParam == SC_CLOSE) {
+                DestroyWindow(hWnd);
+                g_hScreenshotDlg = NULL;
+                return 0;
+            }
+            return DefWindowProc(hWnd, message, wParam, lParam);
+            
+        case WM_CLOSE:
+            DestroyWindow(hWnd);
+            g_hScreenshotDlg = NULL;
+            break;
+            
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+void ShowScreenshotSettings() {
+    if (g_hScreenshotDlg) {
+        SetForegroundWindow(g_hScreenshotDlg);
+        return;
+    }
+    
+    // Регистрируем класс окна
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = ScreenshotDlgProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"ScreenshotSettingsClass";
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
+    
+    // Создаем окно рядом с главным окном
+    RECT mainRect;
+    GetWindowRect(g_hWnd, &mainRect);
+    g_hScreenshotDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ScreenshotSettingsClass", L"Screenshot Settings",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        mainRect.right + 10, mainRect.top, 350, 250,
+        g_hWnd, NULL, GetModuleHandle(NULL), NULL);
+    
+    if (!g_hScreenshotDlg) return;
+    
+    // Создаем элементы управления
+    CreateWindowW(L"STATIC", L"Save folder:", WS_CHILD | WS_VISIBLE, 10, 15, 80, 20, g_hScreenshotDlg, NULL, NULL, NULL);
+    g_hFolderEdit = CreateWindowW(L"EDIT", g_screenshotFolder, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY,
+        10, 35, 200, 22, g_hScreenshotDlg, NULL, NULL, NULL);
+    CreateWindowW(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        220, 35, 70, 22, g_hScreenshotDlg, (HMENU)1005, NULL, NULL);
+    
+    CreateWindowW(L"STATIC", L"Hotkey:", WS_CHILD | WS_VISIBLE, 10, 70, 60, 20, g_hScreenshotDlg, NULL, NULL, NULL);
+    g_hKeyEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_READONLY,
+        10, 90, 100, 22, g_hScreenshotDlg, NULL, NULL, NULL);
+    CreateWindowW(L"BUTTON", L"Change", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        120, 90, 70, 22, g_hScreenshotDlg, (HMENU)1007, NULL, NULL);
+    
+    g_hSaveFolderCheck = CreateWindowW(L"BUTTON", L"Save to folder", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        10, 125, 150, 20, g_hScreenshotDlg, (HMENU)1002, NULL, NULL);
+    SendMessage(g_hSaveFolderCheck, BM_SETCHECK, g_saveToFolder ? BST_CHECKED : BST_UNCHECKED, 0);
+    
+    g_hSaveClipboardCheck = CreateWindowW(L"BUTTON", L"Save to clipboard", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        10, 150, 150, 20, g_hScreenshotDlg, (HMENU)1003, NULL, NULL);
+    SendMessage(g_hSaveClipboardCheck, BM_SETCHECK, g_saveToClipboard ? BST_CHECKED : BST_UNCHECKED, 0);
+    
+    CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        180, 180, 70, 30, g_hScreenshotDlg, (HMENU)IDOK, NULL, NULL);
+    CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        260, 180, 70, 30, g_hScreenshotDlg, (HMENU)IDCANCEL, NULL, NULL);
+    
+    // Отображаем текущую клавишу
+    SetWindowTextW(g_hKeyEdit, GetKeyName(g_screenshotKey));
+}
+
+wchar_t* GetKeyName(int vkCode) {
+    static wchar_t keyName[32];
+    switch (vkCode) {
+        case VK_F1: case VK_F2: case VK_F3: case VK_F4: case VK_F5: case VK_F6:
+        case VK_F7: case VK_F8: case VK_F9: case VK_F10: case VK_F11: case VK_F12:
+            swprintf_s(keyName, L"F%d", vkCode - VK_F1 + 1);
+            break;
+        case VK_SPACE: wcscpy_s(keyName, L"Space"); break;
+        case VK_RETURN: wcscpy_s(keyName, L"Enter"); break;
+        case VK_ESCAPE: wcscpy_s(keyName, L"Esc"); break;
+        case VK_TAB: wcscpy_s(keyName, L"Tab"); break;
+        case VK_BACK: wcscpy_s(keyName, L"Backspace"); break;
+        case VK_DELETE: wcscpy_s(keyName, L"Delete"); break;
+        case VK_INSERT: wcscpy_s(keyName, L"Insert"); break;
+        case VK_HOME: wcscpy_s(keyName, L"Home"); break;
+        case VK_END: wcscpy_s(keyName, L"End"); break;
+        case VK_PRIOR: wcscpy_s(keyName, L"Page Up"); break;
+        case VK_NEXT: wcscpy_s(keyName, L"Page Down"); break;
+        case VK_UP: wcscpy_s(keyName, L"Up"); break;
+        case VK_DOWN: wcscpy_s(keyName, L"Down"); break;
+        case VK_LEFT: wcscpy_s(keyName, L"Left"); break;
+        case VK_RIGHT: wcscpy_s(keyName, L"Right"); break;
+        case VK_SHIFT: wcscpy_s(keyName, L"Shift"); break;
+        case VK_CONTROL: wcscpy_s(keyName, L"Ctrl"); break;
+        case VK_MENU: wcscpy_s(keyName, L"Alt"); break;
+        default:
+            if (vkCode >= '0' && vkCode <= '9') {
+                swprintf_s(keyName, L"%c", vkCode);
+            } else if (vkCode >= 'A' && vkCode <= 'Z') {
+                swprintf_s(keyName, L"%c", vkCode);
+            } else {
+                swprintf_s(keyName, L"Key %d", vkCode);
+            }
+            break;
+    }
+    return keyName;
+}
+
+void StopAudioCapture() {
+    g_shouldStopAudioThread = true;
+    
+    if (g_audioThread) {
+        WaitForSingleObject(g_audioThread, 1000);
+        CloseHandle(g_audioThread);
+        g_audioThread = NULL;
+    }
+    
+    if (g_pAudioClient) { g_pAudioClient->Stop(); g_pAudioClient->Release(); g_pAudioClient = NULL; }
+    if (g_pPlaybackClient) { g_pPlaybackClient->Stop(); g_pPlaybackClient->Release(); g_pPlaybackClient = NULL; }
+    if (g_pCaptureClient) { g_pCaptureClient->Release(); g_pCaptureClient = NULL; }
+    if (g_pRenderClient) { g_pRenderClient->Release(); g_pRenderClient = NULL; }
+    if (g_pDevice) { g_pDevice->Release(); g_pDevice = NULL; }
+    if (g_pEnumerator) { g_pEnumerator->Release(); g_pEnumerator = NULL; }
+}
+
 void UpdateColorList() {
     SendMessage(g_hColorList, LB_RESETCONTENT, 0, 0);
     
@@ -602,6 +1188,12 @@ void SaveSettings() {
         RegSetValueExW(hKey, L"SmoothingPercent", 0, REG_DWORD, (BYTE*)&g_smoothingPercent, sizeof(DWORD));
         RegSetValueExW(hKey, L"VSyncEnabled", 0, REG_DWORD, (BYTE*)&g_vsyncEnabled, sizeof(DWORD));
         RegSetValueExW(hKey, L"GrayscaleMode", 0, REG_DWORD, (BYTE*)&g_grayscaleMode, sizeof(DWORD));
+        RegSetValueExW(hKey, L"EnableAudioCapture", 0, REG_DWORD, (BYTE*)&g_enableAudioCapture, sizeof(DWORD));
+        RegSetValueExW(hKey, L"ScreenshotKey", 0, REG_DWORD, (BYTE*)&g_screenshotKey, sizeof(DWORD));
+        RegSetValueExW(hKey, L"SaveToFolder", 0, REG_DWORD, (BYTE*)&g_saveToFolder, sizeof(DWORD));
+        RegSetValueExW(hKey, L"SaveToClipboard", 0, REG_DWORD, (BYTE*)&g_saveToClipboard, sizeof(DWORD));
+        RegSetValueExW(hKey, L"ScreenshotFormat", 0, REG_DWORD, (BYTE*)&g_screenshotFormat, sizeof(DWORD));
+        RegSetValueExW(hKey, L"ScreenshotFolder", 0, REG_SZ, (BYTE*)g_screenshotFolder, ((DWORD)wcslen(g_screenshotFolder) + 1) * sizeof(wchar_t));
         
         // Сохраняем цвета
         DWORD colorCount = (DWORD)g_targetColors.size();
@@ -622,6 +1214,18 @@ void LoadSettings() {
         RegQueryValueExW(hKey, L"SmoothingPercent", NULL, NULL, (BYTE*)&g_smoothingPercent, &size);
         RegQueryValueExW(hKey, L"VSyncEnabled", NULL, NULL, (BYTE*)&g_vsyncEnabled, &size);
         RegQueryValueExW(hKey, L"GrayscaleMode", NULL, NULL, (BYTE*)&g_grayscaleMode, &size);
+        RegQueryValueExW(hKey, L"EnableAudioCapture", NULL, NULL, (BYTE*)&g_enableAudioCapture, &size);
+        RegQueryValueExW(hKey, L"ScreenshotKey", NULL, NULL, (BYTE*)&g_screenshotKey, &size);
+        RegQueryValueExW(hKey, L"SaveToFolder", NULL, NULL, (BYTE*)&g_saveToFolder, &size);
+        RegQueryValueExW(hKey, L"SaveToClipboard", NULL, NULL, (BYTE*)&g_saveToClipboard, &size);
+        RegQueryValueExW(hKey, L"ScreenshotFormat", NULL, NULL, (BYTE*)&g_screenshotFormat, &size);
+        
+        // Загружаем папку скриншотов
+        size = sizeof(g_screenshotFolder);
+        if (RegQueryValueExW(hKey, L"ScreenshotFolder", NULL, NULL, (BYTE*)g_screenshotFolder, &size) != ERROR_SUCCESS) {
+            // По умолчанию - папка Pictures
+            SHGetFolderPathW(NULL, CSIDL_MYPICTURES, NULL, SHGFP_TYPE_CURRENT, g_screenshotFolder);
+        }
         
         // Загружаем цвета
         DWORD colorCount = 0;
@@ -662,6 +1266,7 @@ void SaveSettingsToFile() {
             WriteFile(hFile, &g_smoothingPercent, sizeof(int), &written, NULL);
             WriteFile(hFile, &g_vsyncEnabled, sizeof(bool), &written, NULL);
             WriteFile(hFile, &g_grayscaleMode, sizeof(int), &written, NULL);
+            WriteFile(hFile, &g_enableAudioCapture, sizeof(bool), &written, NULL);
             
             DWORD colorCount = (DWORD)g_targetColors.size();
             WriteFile(hFile, &colorCount, sizeof(DWORD), &written, NULL);
@@ -701,6 +1306,7 @@ void LoadSettingsFromFile() {
             ReadFile(hFile, &g_smoothingPercent, sizeof(int), &read, NULL);
             ReadFile(hFile, &g_vsyncEnabled, sizeof(bool), &read, NULL);
             ReadFile(hFile, &g_grayscaleMode, sizeof(int), &read, NULL);
+            ReadFile(hFile, &g_enableAudioCapture, sizeof(bool), &read, NULL);
             
             DWORD colorCount;
             ReadFile(hFile, &colorCount, sizeof(DWORD), &read, NULL);
@@ -716,6 +1322,7 @@ void LoadSettingsFromFile() {
             SendMessage(g_hTrackbarSmoothing, TBM_SETPOS, TRUE, g_smoothingPercent);
             SendMessage(g_hVSyncCheckbox, BM_SETCHECK, g_vsyncEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(g_hGrayscaleCombo, CB_SETCURSEL, g_grayscaleMode, 0);
+            SendMessage(g_hAudioCheckbox, BM_SETCHECK, g_enableAudioCapture ? BST_CHECKED : BST_UNCHECKED, 0);
             UpdateLabels();
             UpdateColorList();
             
@@ -829,6 +1436,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
 void RenderFrameForMonitor(MonitorData& monitor) {
     if (!monitor.pDuplication || !monitor.pSwapChain) return;
+    
+    // Проверяем паузу для скриншота
+    if (g_pauseRendering) return;
     
     bool hasNewFrame = false;
     IDXGIResource* pDesktopResource = nullptr;
@@ -962,6 +1572,18 @@ void StartFilter() {
     if (!g_isRunning) {
         g_isRunning = true;
         
+        // Проверяем есть ли выбранные мониторы
+        int selectedCount = 0;
+        for (auto& monitor : g_monitors) {
+            if (monitor.isSelected) selectedCount++;
+        }
+        
+        if (selectedCount == 0) {
+            MessageBoxW(NULL, L"No monitors selected. Please select at least one monitor.", L"Error", MB_OK);
+            g_isRunning = false;
+            return;
+        }
+        
         // Добавляем текущий цвет в список если список пуст
         if (g_targetColors.empty()) {
             g_targetColors.push_back(g_currentColor);
@@ -1062,6 +1684,19 @@ void StartFilter() {
             SetWindowTextW(hFPS, L"0.0 FPS");
         }
         
+        // Запускаем аудио захват если включен
+        if (g_enableAudioCapture) {
+            StartAudioCapture();
+        }
+        
+        // Устанавливаем хук клавиатуры для скриншота
+        if (!g_keyboardHook) {
+            g_keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+        }
+        
+        // Запускаем таймер для поддержания оверлея поверх всех окон
+        g_topMostTimer = SetTimer(g_hWnd, 1001, 1000, NULL); // Каждую секунду
+        
         EnableWindow(g_hButtonStart, FALSE);
         EnableWindow(g_hButtonStop, TRUE);
     }
@@ -1086,6 +1721,21 @@ void StopFilter() {
         
         CleanupDirectX();
         
+        // Останавливаем аудио захват
+        StopAudioCapture();
+        
+        // Снимаем хук клавиатуры
+        if (g_keyboardHook) {
+            UnhookWindowsHookEx(g_keyboardHook);
+            g_keyboardHook = NULL;
+        }
+        
+        // Останавливаем таймер поддержания поверх всех окон
+        if (g_topMostTimer) {
+            KillTimer(g_hWnd, 1001);
+            g_topMostTimer = 0;
+        }
+        
         // Сбрасываем FPS лейблы
         for (auto& hFPS : g_hFPSLabels) {
             SetWindowTextW(hFPS, L"0.0 FPS");
@@ -1108,6 +1758,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             
             g_hEyedropperButton = CreateWindowW(L"BUTTON", L"Pick Color", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                 120, 35, 100, 30, hWnd, (HMENU)5, hInstance, NULL);
+            
+            g_hScreenshotButton = CreateWindowW(L"BUTTON", L"Screenshot", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                230, 35, 80, 30, hWnd, (HMENU)16, hInstance, NULL);
+            
+            // Устанавливаем меньший шрифт для кнопки
+            HFONT hFont = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            SendMessage(g_hScreenshotButton, WM_SETFONT, (WPARAM)hFont, TRUE);
             
             g_hColorList = CreateWindowW(L"LISTBOX", NULL, 
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
@@ -1141,6 +1799,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                 10, 315, 150, 20, hWnd, (HMENU)10, hInstance, NULL);
             SendMessage(g_hVSyncCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+            
+            g_hAudioCheckbox = CreateWindowW(L"BUTTON", L"Capture Audio",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                170, 315, 120, 20, hWnd, (HMENU)14, hInstance, NULL);
             
             CreateWindowW(L"STATIC", L"Grayscale:", WS_CHILD | WS_VISIBLE,
                 10, 345, 70, 20, hWnd, NULL, hInstance, NULL);
@@ -1203,11 +1865,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Загружаем сохраненные настройки
             LoadSettings();
             
+            // Инициализируем папку скриншотов если пуста
+            if (wcslen(g_screenshotFolder) == 0) {
+                SHGetFolderPath(NULL, CSIDL_MYPICTURES, NULL, SHGFP_TYPE_CURRENT, g_screenshotFolder);
+            }
+            
             // Обновляем интерфейс после загрузки
             SendMessage(g_hTrackbarThreshold, TBM_SETPOS, TRUE, g_thresholdPercent);
             SendMessage(g_hTrackbarSmoothing, TBM_SETPOS, TRUE, g_smoothingPercent);
             SendMessage(g_hVSyncCheckbox, BM_SETCHECK, g_vsyncEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(g_hGrayscaleCombo, CB_SETCURSEL, g_grayscaleMode, 0);
+            SendMessage(g_hAudioCheckbox, BM_SETCHECK, g_enableAudioCapture ? BST_CHECKED : BST_UNCHECKED, 0);
             UpdateLabels();
             UpdateColorList();
             
@@ -1229,7 +1897,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         
         case WM_TIMER: {
-            // Убираем обработку таймера - теперь используем цикл в WinMain
+            if (wParam == 1001 && g_isRunning) {
+                // Поддерживаем оверлеи поверх всех окон
+                for (auto& monitor : g_monitors) {
+                    if (monitor.isActive && monitor.hOverlayWnd) {
+                        SetWindowPos(monitor.hOverlayWnd, HWND_TOPMOST, 0, 0, 0, 0, 
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
+                }
+            }
             return 0;
         }
         
@@ -1360,6 +2036,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             else if (LOWORD(wParam) == 13) {
                 LoadSettingsFromFile();
+            }
+            else if (LOWORD(wParam) == 14) {
+                g_enableAudioCapture = (SendMessage(g_hAudioCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                if (g_isRunning) {
+                    if (g_enableAudioCapture) {
+                        StartAudioCapture();
+                    } else {
+                        StopAudioCapture();
+                    }
+                }
+            }
+            else if (LOWORD(wParam) == 16) {
+                ShowScreenshotSettings();
             }
             else if (LOWORD(wParam) == 3) {
                 StartFilter();
