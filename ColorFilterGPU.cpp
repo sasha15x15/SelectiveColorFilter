@@ -1465,24 +1465,26 @@ void StartAudioCapture() {
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && wParam == WM_KEYDOWN) {
         KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
-        if (pKeyboard->vkCode == g_screenshotKey && g_isRunning) {
+        
+        if (pKeyboard->vkCode == g_screenshotKey && g_isRunning && !g_takingScreenshot) {
             TakeScreenshot();
         }
     }
-    // Передаем событие дальше (не блокируем клавишу)
     return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
 }
 
 void TakeScreenshot() {
-    if (!g_isRunning || g_takingScreenshot) return;
+    if (!g_isRunning) {
+        g_takingScreenshot = false;
+        return;
+    }
+    
+    if (g_takingScreenshot) return;
     
     g_takingScreenshot = true;
-    
-    // Приостанавливаем рендеринг
     g_pauseRendering = true;
-    Sleep(50); // Даем время завершить текущий кадр
+    Sleep(50);
     
-    // Находим первый активный монитор
     MonitorData* activeMonitor = nullptr;
     for (auto& monitor : g_monitors) {
         if (monitor.isActive) {
@@ -1497,7 +1499,8 @@ void TakeScreenshot() {
         return;
     }
     
-    // Получаем back buffer из SwapChain (отрендеренный кадр с фильтром)
+    activeMonitor->pContext->Flush();
+    
     ID3D11Texture2D* pBackBuffer = nullptr;
     HRESULT hr = activeMonitor->pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
     if (FAILED(hr)) {
@@ -1509,7 +1512,6 @@ void TakeScreenshot() {
     D3D11_TEXTURE2D_DESC desc;
     pBackBuffer->GetDesc(&desc);
     
-    // Создаем staging texture
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -1524,31 +1526,26 @@ void TakeScreenshot() {
         return;
     }
     
-    // Копируем отрендеренный кадр
     activeMonitor->pContext->CopyResource(pStagingTexture, pBackBuffer);
     
-    // Читаем данные (теперь без DO_NOT_WAIT, так как рендеринг приостановлен)
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = activeMonitor->pContext->Map(pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
     
     if (SUCCEEDED(hr)) {
-        // Создаем копию данных и исправляем цветовые каналы
         UINT dataSize = desc.Height * mapped.RowPitch;
         BYTE* pixelData = new BYTE[dataSize];
         memcpy(pixelData, mapped.pData, dataSize);
         
         activeMonitor->pContext->Unmap(pStagingTexture, 0);
         
-        // Исправляем порядок цветовых каналов (BGRA -> RGBA)
         for (UINT y = 0; y < desc.Height; y++) {
             BYTE* row = pixelData + y * mapped.RowPitch;
             for (UINT x = 0; x < desc.Width; x++) {
                 BYTE* pixel = row + x * 4;
-                std::swap(pixel[0], pixel[2]); // Меняем B и R местами
+                std::swap(pixel[0], pixel[2]);
             }
         }
         
-        // Создаем bitmap
         BITMAPINFOHEADER bi = {};
         bi.biSize = sizeof(BITMAPINFOHEADER);
         bi.biWidth = desc.Width;
@@ -1562,16 +1559,17 @@ void TakeScreenshot() {
         ReleaseDC(NULL, hdc);
         
         if (hBitmap) {
-            // Сохраняем в буфер обмена
+            bool saved = false;
+            
             if (g_saveToClipboard) {
                 if (OpenClipboard(g_hWnd)) {
                     EmptyClipboard();
                     SetClipboardData(CF_BITMAP, hBitmap);
                     CloseClipboard();
+                    saved = true;
                 }
             }
             
-            // Сохраняем в файл
             if (g_saveToFolder && wcslen(g_screenshotFolder) > 0) {
                 SYSTEMTIME st;
                 GetLocalTime(&st);
@@ -1591,7 +1589,12 @@ void TakeScreenshot() {
                     WriteFile(hFile, &bi, sizeof(bi), &written, NULL);
                     WriteFile(hFile, pixelData, desc.Width * desc.Height * 4, &written, NULL);
                     CloseHandle(hFile);
+                    saved = true;
                 }
+            }
+            
+            if (!saved) {
+                MessageBoxW(g_hWnd, L"Screenshot not saved! Please configure screenshot settings (folder or clipboard).", L"Screenshot", MB_OK | MB_ICONWARNING);
             }
             
             if (!g_saveToClipboard) {
@@ -1605,7 +1608,6 @@ void TakeScreenshot() {
     pStagingTexture->Release();
     pBackBuffer->Release();
     
-    // Возобновляем рендеринг
     g_pauseRendering = false;
     g_takingScreenshot = false;
 }
@@ -2760,7 +2762,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 void RenderFrameForMonitor(MonitorData& monitor) {
     if (!monitor.pDuplication || !monitor.pSwapChain) return;
     
-    // Проверяем паузу для скриншота
     if (g_pauseRendering) return;
     
     bool hasNewFrame = false;
@@ -2907,7 +2908,7 @@ void RenderFrameForMonitor(MonitorData& monitor) {
     
     // Если Glow включен, рендерим в промежуточную текстуру, иначе сразу в backbuffer
     ID3D11RenderTargetView* pBaseRTV = monitor.pRenderTargetView;
-    if (g_glowEffect.enabled && monitor.pBrightPassShader && monitor.pGlowRTV1 && monitor.pIntermediateRTV) {
+    if (g_glowEffect.enabled && monitor.pBrightPassShader && monitor.pGlowRTV1 && monitor.pIntermediateRTV && monitor.pIntermediateSRV) {
         pBaseRTV = monitor.pIntermediateRTV;
     }
     
@@ -2920,7 +2921,7 @@ void RenderFrameForMonitor(MonitorData& monitor) {
     monitor.pContext->Draw(4, 0);
     
     // Если Glow включен, применяем многопроходный эффект
-    if (g_glowEffect.enabled && monitor.pBrightPassShader && monitor.pGlowRTV1 && monitor.pIntermediateSRV) {
+    if (g_glowEffect.enabled && monitor.pBrightPassShader && monitor.pGlowRTV1 && monitor.pIntermediateRTV && monitor.pIntermediateSRV) {
             // PASS 2: Bright Pass - выделяем яркие области
             D3D11_VIEWPORT glowViewport = {};
             glowViewport.Width = (float)(monitor.screenWidth / (int)g_glowEffect.downsample);
@@ -3047,6 +3048,8 @@ void RenderFrameForMonitor(MonitorData& monitor) {
 void StartFilter() {
     if (!g_isRunning) {
         g_isRunning = true;
+        g_takingScreenshot = false;
+        g_pauseRendering = false;
         
         // Проверяем есть ли выбранные мониторы
         int selectedCount = 0;
@@ -3168,6 +3171,9 @@ void StartFilter() {
         // Устанавливаем хук клавиатуры для скриншота
         if (!g_keyboardHook) {
             g_keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+            if (!g_keyboardHook) {
+                MessageBoxW(NULL, L"Failed to install keyboard hook for screenshots!", L"Warning", MB_OK | MB_ICONWARNING);
+            }
         }
         
         // Запускаем таймер для поддержания оверлея поверх всех окон
@@ -3377,6 +3383,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     SetWindowTextW(g_hFPSLabels[i], L"0.0 FPS");
                 }
             }
+            return 0;
+        }
+        
+        case WM_USER + 100: {
+            MessageBoxW(NULL, L"WM_USER+100 received!", L"Debug", MB_OK);
+            TakeScreenshot();
             return 0;
         }
         
